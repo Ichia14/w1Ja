@@ -1,0 +1,40 @@
+name: Fetch public neural-operator slides
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download and verify the official PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="23-neural-operators.pdf"
+          https_url="https://flowlab.groups.et.byu.net/me595r/slides/23-neural-operators.pdf"
+          http_url="http://flowlab.groups.et.byu.net/me595r/slides/23-neural-operators.pdf"
+          curl -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 \
+            -A "Mozilla/5.0" "$https_url" -o "$out" || \
+          curl -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 \
+            -A "Mozilla/5.0" "$http_url" -o "$out"
+          test "$(head -c 4 "$out")" = "%PDF"
+          test "$(stat -c%s "$out")" -gt 10000
+          pdfinfo "$out" | sed -n '1,20p'
+          sha256sum "$out" > SHA256SUMS.txt
+
+      - name: Upload slides
+        uses: actions/upload-artifact@v4
+        with:
+          name: neural-operators-slides
+          path: |
+            23-neural-operators.pdf
+            SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
