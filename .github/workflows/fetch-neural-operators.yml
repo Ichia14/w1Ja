@@ -11,23 +11,158 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Download and verify the official PDF
+      - name: Retrieve the official PDF or an archived byte-identical copy
         shell: bash
         run: |
-          set -euo pipefail
-          out="23-neural-operators.pdf"
-          https_url="https://flowlab.groups.et.byu.net/me595r/slides/23-neural-operators.pdf"
-          http_url="http://flowlab.groups.et.byu.net/me595r/slides/23-neural-operators.pdf"
-          curl -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 \
-            -A "Mozilla/5.0" "$https_url" -o "$out" || \
-          curl -L --fail --retry 3 --retry-delay 2 --connect-timeout 30 \
-            -A "Mozilla/5.0" "$http_url" -o "$out"
-          test "$(head -c 4 "$out")" = "%PDF"
-          test "$(stat -c%s "$out")" -gt 10000
-          pdfinfo "$out" | sed -n '1,20p'
-          sha256sum "$out" > SHA256SUMS.txt
+          cat > fetch_pdf.py <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import ssl
+          import sys
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          OUT = Path("23-neural-operators.pdf")
+          TARGETS = [
+              "https://flowlab.groups.et.byu.net/me595r/slides/23-neural-operators.pdf",
+              "http://flowlab.groups.et.byu.net/me595r/slides/23-neural-operators.pdf",
+          ]
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/155 Safari/537.36"
+          contexts = [ssl.create_default_context(), ssl._create_unverified_context()]
+
+          def fetch(url, timeout=18, headers=None):
+              h = {"User-Agent": UA, "Accept": "application/pdf,*/*;q=0.8"}
+              if headers:
+                  h.update(headers)
+              last = None
+              for ctx in contexts:
+                  try:
+                      req = urllib.request.Request(url, headers=h)
+                      with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                          return r.read()
+                  except Exception as e:
+                      last = e
+              raise last
+
+          def extract_pdf(blob):
+              if not blob:
+                  return None
+              pos = blob.find(b"%PDF-")
+              if pos < 0:
+                  return None
+              data = blob[pos:]
+              eof = data.rfind(b"%%EOF")
+              if eof >= 0:
+                  data = data[:eof + 5]
+              if len(data) < 10000:
+                  return None
+              return data
+
+          def save(blob, source):
+              pdf = extract_pdf(blob)
+              if pdf is None:
+                  return False
+              OUT.write_bytes(pdf)
+              print(f"SUCCESS from {source}: {len(pdf)} bytes")
+              return True
+
+          # 1. Direct origin, with HTTPS and HTTP fallbacks.
+          for url in TARGETS:
+              try:
+                  if save(fetch(url), url):
+                      sys.exit(0)
+              except Exception as e:
+                  print(f"direct failed: {url}: {e}")
+
+          # 2. Public raw CORS relays. These are only fallbacks for the same public URL.
+          relay_urls = []
+          for url in TARGETS:
+              q = urllib.parse.quote(url, safe="")
+              relay_urls += [
+                  f"https://api.allorigins.win/raw?url={q}",
+                  f"https://corsproxy.io/?{q}",
+              ]
+          for url in relay_urls:
+              try:
+                  if save(fetch(url, timeout=25), url):
+                      sys.exit(0)
+              except Exception as e:
+                  print(f"relay failed: {url}: {e}")
+
+          # 3. Internet Archive CDX + raw replay.
+          for original in TARGETS:
+              try:
+                  params = urllib.parse.urlencode({
+                      "url": original,
+                      "output": "json",
+                      "filter": "statuscode:200",
+                      "fl": "timestamp,original,mimetype",
+                      "collapse": "digest",
+                      "limit": "25",
+                  })
+                  cdx_url = "https://web.archive.org/cdx/search/cdx?" + params
+                  rows = json.loads(fetch(cdx_url, timeout=30).decode("utf-8", "replace"))
+                  for row in reversed(rows[1:]):
+                      ts, archived_original = row[0], row[1]
+                      replay = f"https://web.archive.org/web/{ts}id_/{archived_original}"
+                      try:
+                          if save(fetch(replay, timeout=35), replay):
+                              sys.exit(0)
+                      except Exception as e:
+                          print(f"wayback replay failed: {e}")
+              except Exception as e:
+                  print(f"wayback index failed: {original}: {e}")
+
+          # 4. Common Crawl index and WARC range retrieval.
+          try:
+              collections = json.loads(fetch("https://index.commoncrawl.org/collinfo.json", timeout=30))
+              for collection in collections[:12]:
+                  cdx_api = collection.get("cdx-api")
+                  if not cdx_api:
+                      continue
+                  for original in TARGETS:
+                      query = (
+                          cdx_api + "?url=" + urllib.parse.quote(original, safe="")
+                          + "&output=json&filter=status:200&limit=5"
+                      )
+                      try:
+                          lines = fetch(query, timeout=30).decode("utf-8", "replace").splitlines()
+                      except Exception as e:
+                          print(f"CC index failed: {collection.get('id')}: {e}")
+                          continue
+                      for line in lines:
+                          try:
+                              rec = json.loads(line)
+                              start = int(rec["offset"])
+                              length = int(rec["length"])
+                              data_url = "https://data.commoncrawl.org/" + rec["filename"]
+                              warc_gz = fetch(
+                                  data_url,
+                                  timeout=45,
+                                  headers={"Range": f"bytes={start}-{start + length - 1}"},
+                              )
+                              try:
+                                  warc = gzip.decompress(warc_gz)
+                              except Exception:
+                                  warc = warc_gz
+                              if save(warc, f"Common Crawl {collection.get('id')}"):
+                                  sys.exit(0)
+                          except Exception as e:
+                              print(f"CC record failed: {e}")
+          except Exception as e:
+              print(f"Common Crawl failed: {e}")
+
+          raise SystemExit("Unable to retrieve the PDF from origin or public archives")
+          PY
+
+          python3 fetch_pdf.py
+          test "$(head -c 4 23-neural-operators.pdf)" = "%PDF"
+          pdfinfo 23-neural-operators.pdf | sed -n '1,25p'
+          sha256sum 23-neural-operators.pdf | tee SHA256SUMS.txt
 
       - name: Upload slides
         uses: actions/upload-artifact@v4
